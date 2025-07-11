@@ -1,50 +1,43 @@
-use tokio::net::TcpListener;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use std::error::Error;
-use serde::{Deserialize, Serialize};
+mod config;
+mod handlers;
+mod job;
+mod wallet;
 
-#[derive(Debug, Serialize, Deserialize)]
-struct MiningRequest {
-    id: u32,
-    method: String,
-    params: serde_json::Value,
-}
+use crate::config::load_config;
+use crate::wallet::WalletRotator;
+
+use std::sync::Arc;
+use tokio::net::TcpListener;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    env_logger::init();
-    let listener = TcpListener::bind("0.0.0.0:3333").await?;
-    println!("✅ Solo Pool listening on port 3333");
+async fn main() {
+    // Load configuration from pool.toml
+    let config = load_config();
+    println!("[+] Starting Solo-Pool on port {} with {} wallets", config.port, config.wallets.len());
 
+    // Initialize wallet rotator
+    let wallet_rotator = WalletRotator::new(config.wallets.clone());
+
+    // Start listening for miners
+    let listener = TcpListener::bind(("0.0.0.0", config.port))
+        .await
+        .expect("[!] Failed to bind to port");
+
+    // Spawn a job simulation loop (optional)
+    tokio::spawn(job::start_job_broadcast());
+
+    // Accept loop
     loop {
-        let (mut socket, addr) = listener.accept().await?;
-        println!("📥 Connection from {addr}");
-
-        tokio::spawn(async move {
-            let (reader, mut writer) = socket.split();
-            let reader = BufReader::new(reader);
-            let mut lines = reader.lines();
-
-            while let Ok(Some(line)) = lines.next_line().await {
-                println!("⛏️  Received: {line}");
-
-                match serde_json::from_str::<MiningRequest>(&line) {
-                    Ok(req) => {
-                        println!("🧠 Parsed method: {}", req.method);
-                        if req.method == "mining.subscribe" {
-                            let response = serde_json::json!({
-                                "id": req.id,
-                                "result": [["mining.set_difficulty", "subscription_id"]],
-                                "error": null
-                            });
-                            let resp_str = serde_json::to_string(&response).unwrap();
-                            let _ = writer.write_all((resp_str + "\n").as_bytes()).await;
-                        }
-                    },
-                    Err(err) => eprintln!("⚠️  Failed to parse: {err}"),
-                }
+        match listener.accept().await {
+            Ok((socket, addr)) => {
+                println!("[*] New miner connected: {}", addr);
+                let rotator = Arc::clone(&wallet_rotator);
+                tokio::spawn(handlers::handle_client(socket, rotator));
             }
-        });
+            Err(e) => {
+                eprintln!("[!] Connection failed: {}", e);
+            }
+        }
     }
 }
 
